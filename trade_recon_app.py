@@ -152,6 +152,14 @@ CROSS_ID_PRICE_TOLERANCE = 0.0          # exact match only, per business sign-of
 CROSS_ID_SUBSET_SUM_ITEM_LIMIT = 200    # no practical cap requested; kept as a
                                          # safety ceiling against pathological input
 
+# --- 1h. Missing-set attribute aggregation (new enhancement layer, Section 8) ------
+# Runs AFTER the main reconcile() and AFTER the cross-ID aggregation in 3B.
+# For Murex IDs that land in Missing-in-Broker (no direct broker ID match at all),
+# searches among broker rows sitting in Missing-in-Murex for a unique combination
+# whose lots sum equals the Murex quantity, filtered by price (exact), then trader,
+# then commodity if still ambiguous.  Same "no guessing" policy as cross-ID.
+DEFAULT_ENABLE_MISSING_ATTR_RESOLUTION = True
+
 
 @dataclass
 class ReconConfig:
@@ -162,6 +170,7 @@ class ReconConfig:
     subset_sum_item_limit: int = SUBSET_SUM_ITEM_LIMIT
     enable_cross_id_aggregation: bool = DEFAULT_ENABLE_CROSS_ID_AGGREGATION
     cross_id_subset_sum_item_limit: int = CROSS_ID_SUBSET_SUM_ITEM_LIMIT
+    enable_missing_attr_resolution: bool = DEFAULT_ENABLE_MISSING_ATTR_RESOLUTION
 
 
 # ==============================================================================
@@ -326,6 +335,12 @@ class ReconResult:
                                                                     # resolved by combining
                                                                     # orphaned broker rows
                                                                     # across DIFFERENT IDs.
+    missing_attr_resolved: List[dict] = field(default_factory=list) # Enhancement layer
+                                                                     # (Section 8): Murex
+                                                                     # orphans resolved from
+                                                                     # broker orphan pool by
+                                                                     # trader+price+commodity
+                                                                     # lots-sum match.
     broker_count: int = 0
     murex_count: int = 0
     broker_ids_count: int = 0
@@ -931,6 +946,184 @@ def _resolve_cross_id_aggregation(broker_df: pd.DataFrame, murex_df: pd.DataFram
 
 
 # ==============================================================================
+# 3C. MISSING-SET ATTRIBUTE AGGREGATION  -  NEW ENHANCEMENT LAYER (Section 8)
+# ==============================================================================
+# Runs strictly AFTER reconcile() AND after _resolve_cross_id_aggregation().
+# It never touches an existing PASS or FAIL entry.
+#
+# Problem it solves
+# -----------------
+# In some real-world file pairs (e.g. Tullett Prebon vs Murex) the Murex G.ID
+# is a *parent* identifier that has NO exact match among the broker's granular
+# per-execution IDs (e.g. Murex 'ID17818888630000' vs broker rows like
+# 'ID178188886300000001', 'ID178188886300000002', ...).  Because the IDs never
+# intersect, reconcile() dumps ALL broker rows into Missing-in-Murex and ALL
+# Murex rows into Missing-in-Broker.  The cross-ID layer in 3B never fires
+# because there are no id_failed records.
+#
+# Business rule (documented & agreed):
+#   For each Murex entry sitting in Missing-in-Broker:
+#     1. Extract its price, trader, commodity and target qty.
+#     2. Among broker rows currently in Missing-in-Murex (and not yet consumed),
+#        filter by: exact price first, then trader (exact), then commodity if
+#        still > 1 candidate.
+#     3. Find whether exactly ONE subset of the filtered candidates sums to the
+#        Murex qty (same knapsack uniqueness algorithm as cross-ID).
+#     4. If EXACTLY ONE combination exists => move both sides to
+#        result.missing_attr_resolved, remove from both missing lists.
+#     5. Zero matches OR tie => leave as Missing with an explanatory comment.
+# ==============================================================================
+
+def _resolve_missing_by_attribute_aggregation(
+        broker_df: pd.DataFrame, murex_df: pd.DataFrame,
+        result: ReconResult, config: ReconConfig) -> None:
+    """Mutates `result` in-place: moves cleanly-resolved missing entries out of
+    missing_in_murex / missing_in_broker and into missing_attr_resolved.
+    Everything else is left completely untouched."""
+
+    if not config.enable_missing_attr_resolution:
+        return
+
+    # Build _row_ref -> dataframe index lookups for fast attribute access.
+    b_lookup = {broker_df.at[i, "_row_ref"]: i for i in broker_df.index}
+    m_lookup = {murex_df.at[i, "_row_ref"]: i for i in murex_df.index}
+
+    # Which broker _row_refs are currently orphaned (in missing_in_murex)?
+    orphan_broker_refs = set()
+    for entry in result.missing_in_murex:
+        for leg in entry["broker_legs"]:
+            orphan_broker_refs.add(leg["_row_ref"])
+
+    # Broker row refs consumed by this layer (so the same row is never reused).
+    consumed_broker_refs = set()
+
+    still_missing_broker = []
+
+    for murex_entry in result.missing_in_broker:
+        m_legs = murex_entry["murex_legs"]
+        target_qty = murex_entry["murex_qty_total"]
+
+        # --- Pull trader / price / commodity from the Murex leg(s) ----------
+        trader = None
+        price = None
+        commodity = None
+        for leg in m_legs:
+            ref = leg.get("_row_ref")
+            idx = m_lookup.get(ref)
+            if idx is None:
+                continue
+            if trader is None:
+                raw = murex_df.at[idx, "trader"]
+                if raw is not None and not (isinstance(raw, float) and pd.isna(raw)):
+                    trader = str(raw).strip() or None
+            if price is None:
+                p = murex_df.at[idx, "price"]
+                if p is not None and not (isinstance(p, float) and pd.isna(p)):
+                    try:
+                        price = float(p)
+                    except (ValueError, TypeError):
+                        pass
+            if commodity is None:
+                c = murex_df.at[idx, "instrument"]
+                if c and str(c) not in ("None", "nan", "", "NONE"):
+                    commodity = str(c).strip().upper() or None
+
+        # Price is the minimum required filter; without it we cannot safely
+        # narrow candidates, so leave the entry as Missing.
+        if price is None:
+            still_missing_broker.append(murex_entry)
+            continue
+
+        # --- Candidate pool: orphaned broker rows not yet consumed -----------
+        available_refs = orphan_broker_refs - consumed_broker_refs
+        candidate_idx = [b_lookup[ref] for ref in available_refs if ref in b_lookup]
+        if not candidate_idx:
+            still_missing_broker.append(murex_entry)
+            continue
+
+        candidates = broker_df.loc[candidate_idx].copy()
+
+        # Filter 1: exact price
+        candidates = candidates[
+            candidates["price"].notna() &
+            (candidates["price"].sub(price).abs() <= CROSS_ID_PRICE_TOLERANCE)
+        ]
+        if candidates.empty:
+            still_missing_broker.append(murex_entry)
+            continue
+
+        # Filter 2: trader (if available on the Murex side)
+        if trader:
+            narrowed = candidates[candidates["trader"] == trader]
+            if not narrowed.empty:
+                candidates = narrowed
+
+        # Filter 3: commodity/instrument (only if still > 1 candidate)
+        if len(candidates) > 1 and commodity:
+            narrowed = candidates[candidates["instrument"] == commodity]
+            if not narrowed.empty:
+                candidates = narrowed
+
+        # --- Unique subset-sum check ----------------------------------------
+        items = [(str(r), candidates.at[r, "quantity"]) for r in candidates.index]
+        is_unique, winning_keys = _find_exact_subset_unique(
+            items, target_qty, config.quantity_tolerance,
+            limit=config.cross_id_subset_sum_item_limit,
+        )
+
+        if not is_unique:
+            murex_entry["attr_match_comment"] = (
+                f"Attribute aggregation searched {len(items)} candidate broker row(s) "
+                f"(price={price}, trader='{trader}', commodity='{commodity}') for a unique "
+                f"subset summing to {target_qty} lots. "
+                "Either no combination was found or more than one valid combination "
+                "exists — left as Missing in Broker for manual review."
+            )
+            still_missing_broker.append(murex_entry)
+            continue
+
+        # --- Resolved: exactly one unambiguous combination ------------------
+        chosen_idx = [int(r) for r in winning_keys]
+        chosen_refs = {broker_df.at[i, "_row_ref"] for i in chosen_idx}
+        consumed_broker_refs.update(chosen_refs)
+
+        warning_notes = []
+        b_dates = broker_df.loc[chosen_idx, "trade_date"].dropna().unique()
+        b_directions = broker_df.loc[chosen_idx, "direction"].dropna().unique()
+        if len(b_dates) > 1:
+            warning_notes.append("Trade dates differ across the combined broker rows.")
+        if len(b_directions) > 1:
+            warning_notes.append("Direction (buy/sell) differs across the combined broker rows.")
+        m_dates_raw = [leg.get("trade_date") for leg in m_legs]
+        m_dates_valid = [d for d in m_dates_raw if d]
+        if len(b_dates) == 1 and len(m_dates_valid) == 1:
+            if str(b_dates[0])[:10] != str(m_dates_valid[0])[:10]:
+                warning_notes.append("Trade date differs between broker and Murex side.")
+
+        resolved_record = {
+            "murex_link_id": murex_entry["link_id"],
+            "resolution_type": "Resolved by Attribute Aggregation (Missing sets)",
+            "matched_by": {"trader": trader, "price": price, "commodity": commodity},
+            "broker_legs": _fmt_many(broker_df, chosen_idx),
+            "murex_legs": m_legs,
+            "broker_qty_total": float(broker_df.loc[chosen_idx, "quantity"].sum()),
+            "murex_qty_total": target_qty,
+            "warning_notes": warning_notes,
+        }
+        result.missing_attr_resolved.append(resolved_record)
+
+        # Remove consumed broker rows from missing_in_murex.
+        result.missing_in_murex = [
+            e for e in result.missing_in_murex
+            if not set(leg["_row_ref"] for leg in e["broker_legs"]).issubset(chosen_refs)
+        ]
+        # Shrink the orphan pool for subsequent iterations.
+        orphan_broker_refs -= chosen_refs
+
+    result.missing_in_broker = still_missing_broker
+
+
+# ==============================================================================
 # 4. EXCEL REPORT BUILDER
 # ==============================================================================
 
@@ -994,10 +1187,12 @@ def _build_summary(wb, result: ReconResult, config: ReconConfig):
     n_missing_murex = len(result.missing_in_murex)
     n_missing_broker = len(result.missing_in_broker)
     n_cross_id_resolved = len(result.cross_id_resolved)
+    n_missing_attr_resolved = len(result.missing_attr_resolved)
     # Each resolved CASE can cover multiple broker IDs (e.g. one Murex ID
     # resolved by combining 14 different broker IDs) - for the "% of broker
     # IDs reconciled" status line, count broker IDs covered, not cases.
     n_cross_id_resolved_broker_ids = sum(len(r["broker_legs"]) for r in result.cross_id_resolved)
+    n_missing_attr_resolved_broker_ids = sum(len(r["broker_legs"]) for r in result.missing_attr_resolved)
 
     rows = [
         ("Total trade rows in Broker File", result.broker_count),
@@ -1008,6 +1203,7 @@ def _build_summary(wb, result: ReconResult, config: ReconConfig):
         ("IDs Reconciled - PASS (single leg)", len(result.id_passed)),
         ("IDs Reconciled - PASS (aggregated / multi-leg)", len(result.id_passed_aggregated)),
         ("IDs Resolved - PASS (Cross-ID Aggregation, enhancement layer)", n_cross_id_resolved),
+        ("IDs Resolved - PASS (Attribute Aggregation, missing-set layer)", n_missing_attr_resolved),
         ("IDs Reconciled - FAIL (field mismatch)", n_fail),
         ("IDs Missing in Murex (present in Broker only)", n_missing_murex),
         ("IDs Missing in Broker (present in Murex only)", n_missing_broker),
@@ -1041,7 +1237,7 @@ def _build_summary(wb, result: ReconResult, config: ReconConfig):
     # n_cross_id_resolved is always 0 when the enhancement layer is disabled
     # or finds nothing, so this calculation is identical to the original
     # behaviour in that case.
-    pct_clean = 100.0 * (n_pass + n_cross_id_resolved_broker_ids) / total_ids if total_ids else 0.0
+    pct_clean = 100.0 * (n_pass + n_cross_id_resolved_broker_ids + n_missing_attr_resolved_broker_ids) / total_ids if total_ids else 0.0
     status_cell = ws.cell(row=r, column=1, value=f"{pct_clean:.1f}% of Broker trade IDs reconciled cleanly (PASS)")
     status_cell.fill = PASS_FILL if pct_clean >= 95 else (WARN_FILL if pct_clean >= 80 else FAIL_FILL)
     status_cell.font = BOLD
@@ -1067,6 +1263,9 @@ def _build_summary(wb, result: ReconResult, config: ReconConfig):
     r += 1
     ws.cell(row=r, column=1, value="Cross-ID aggregation (enhancement layer)").font = BOLD
     ws.cell(row=r, column=2, value=str(config.enable_cross_id_aggregation))
+    r += 1
+    ws.cell(row=r, column=1, value="Attribute aggregation for missing sets (Section 8)").font = BOLD
+    ws.cell(row=r, column=2, value=str(config.enable_missing_attr_resolution))
 
     ws.column_dimensions["A"].width = 48
     ws.column_dimensions["B"].width = 32
@@ -1339,6 +1538,65 @@ def _build_cross_id_resolved(wb, result: ReconResult):
     _autosize(ws)
 
 
+def _build_missing_attr_resolved(wb, result: ReconResult):
+    """Sheet: cases resolved by the Missing-set Attribute Aggregation layer
+    (Section 8). Kept separate from 'Matched (PASS)' for full traceability."""
+    ws = wb.create_sheet("Resolved - Attr Aggregation")
+    ws["A1"] = "Resolved by Attribute Aggregation (Missing Sets)"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells("A1:F1")
+    ws["A2"] = (
+        "These Murex entries had no direct ID match in the broker file. "
+        "Broker rows sitting in the Missing-in-Murex pool were filtered by matching price "
+        "(exact), then trader, then commodity, and the unique combination whose lots sum "
+        "equals the Murex quantity was accepted as a PASS. Multiple valid combinations "
+        "are always left as Missing for manual review."
+    )
+    ws["A2"].font = Font(name=FONT_NAME, italic=True)
+    ws.merge_cells("A2:F2")
+
+    headers = ["Murex Link ID", "Matched By (Trader / Price / Commodity)",
+               "Broker Leg Count", "Broker Lots (each leg)", "Broker Lots Sum",
+               "Murex Lots Sum", "Warnings"]
+    _write_header(ws, headers, row=4)
+    r = 5
+    for rec in result.missing_attr_resolved:
+        mb = rec["matched_by"]
+        matched_by_text = f"{mb.get('trader')} / {mb.get('price')} / {mb.get('commodity') or '-'}"
+        b_lots = ", ".join(str(l["quantity"]) for l in rec["broker_legs"])
+        warnings_text = "; ".join(rec.get("warning_notes", [])) or ""
+        ws.append([rec["murex_link_id"], matched_by_text, len(rec["broker_legs"]),
+                   b_lots, rec["broker_qty_total"], rec["murex_qty_total"], warnings_text])
+        fill = WARN_FILL if warnings_text else PASS_FILL
+        for c in range(1, len(headers) + 1):
+            ws.cell(row=r, column=c).fill = fill
+        r += 1
+    _apply_borders(ws, len(result.missing_attr_resolved), len(headers), start_row=5)
+    _autosize(ws)
+    ws.freeze_panes = "A5"
+
+    # Leg-level detail below the summary block
+    r += 2
+    ws.cell(row=r, column=1, value="Leg-Level Detail").font = SUBTITLE_FONT
+    r += 1
+    detail_headers = [f"Broker {h}" for h in LEG_HEADERS] + [f"Murex {h}" for h in LEG_HEADERS]
+    _write_header(ws, detail_headers, row=r)
+    r += 1
+    start = r
+    for rec in result.missing_attr_resolved:
+        b_legs, m_legs = rec["broker_legs"], rec["murex_legs"]
+        n_lines = max(len(b_legs), len(m_legs))
+        for i in range(n_lines):
+            b = b_legs[i] if i < len(b_legs) else {c: "" for c in LEG_COLS}
+            m = m_legs[i] if i < len(m_legs) else {c: "" for c in LEG_COLS}
+            ws.append([b.get(c) for c in LEG_COLS] + [m.get(c) for c in LEG_COLS])
+            for c in range(1, len(detail_headers) + 1):
+                ws.cell(row=r, column=c).fill = PASS_FILL
+            r += 1
+    _apply_borders(ws, r - start, len(detail_headers), start_row=start)
+    _autosize(ws)
+
+
 def build_report(result: ReconResult, config: ReconConfig, output_path: str):
     wb = Workbook()
     _build_summary(wb, result, config)
@@ -1351,6 +1609,8 @@ def build_report(result: ReconResult, config: ReconConfig, output_path: str):
     _build_fallback(wb, result)
     if result.cross_id_resolved:
         _build_cross_id_resolved(wb, result)
+    if result.missing_attr_resolved:
+        _build_missing_attr_resolved(wb, result)
     wb.save(output_path)
     return output_path
 
@@ -1434,6 +1694,14 @@ if broker_file and murex_file:
                  "Missing into a separate 'Resolved by Cross-ID Aggregation' section. Never "
                  "guesses between multiple possible combinations - those are left as-is for "
                  "manual review. Uncheck to fully restore the original behaviour.")
+        enable_missing_attr = st.checkbox(
+            "Enable attribute aggregation for missing sets (Section 8)",
+            value=DEFAULT_ENABLE_MISSING_ATTR_RESOLUTION,
+            help="For Murex IDs with NO matching broker ID at all, searches broker rows in "
+                 "the Missing-in-Murex pool by exact price, then trader, then commodity, and "
+                 "accepts the match when exactly ONE unique lot-sum combination equals the "
+                 "Murex quantity. Handles the case where Murex holds a parent/aggregated ID "
+                 "while the broker sends granular per-execution IDs. Uncheck to disable.")
 
     config = ReconConfig(
         price_tolerance=price_tol,
@@ -1441,6 +1709,7 @@ if broker_file and murex_file:
         group_keys=fallback_keys,
         enable_fallback_matching=enable_fallback,
         enable_cross_id_aggregation=enable_cross_id,
+        enable_missing_attr_resolution=enable_missing_attr,
     )
 
     if st.button("▶️ Run Reconciliation", type="primary"):
@@ -1453,6 +1722,11 @@ if broker_file and murex_file:
             # into a separate, clearly-tagged resolved category. Never touches
             # an existing PASS. Fully reversible via the checkbox in the UI.
             _resolve_cross_id_aggregation(broker_df, murex_df, result, config)
+            # Enhancement layer (Section 8) - runs after Section 7. Resolves
+            # Murex orphans (Missing-in-Broker) against broker orphans
+            # (Missing-in-Murex) by price + trader + commodity + lots-sum.
+            # Same no-guessing policy. Fully reversible via checkbox.
+            _resolve_missing_by_attribute_aggregation(broker_df, murex_df, result, config)
 
             with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
                 build_report(result, config, tmp.name)
@@ -1461,7 +1735,7 @@ if broker_file and murex_file:
         st.success("Reconciliation complete!")
 
         n_pass = len(result.id_passed) + len(result.id_passed_aggregated)
-        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+        m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
         m1.metric("Broker IDs", result.broker_ids_count)
         m2.metric("Murex IDs", result.murex_ids_count)
         m3.metric("PASS", n_pass)
@@ -1469,9 +1743,11 @@ if broker_file and murex_file:
         m5.metric("Missing in Murex", len(result.missing_in_murex))
         m6.metric("Missing in Broker", len(result.missing_in_broker))
         m7.metric("Cross-ID Resolved", len(result.cross_id_resolved))
+        m8.metric("Attr Resolved", len(result.missing_attr_resolved))
 
         n_cross_id_resolved_broker_ids = sum(len(r["broker_legs"]) for r in result.cross_id_resolved)
-        pct = 100 * (n_pass + n_cross_id_resolved_broker_ids) / result.broker_ids_count if result.broker_ids_count else 0
+        n_missing_attr_resolved_broker_ids = sum(len(r["broker_legs"]) for r in result.missing_attr_resolved)
+        pct = 100 * (n_pass + n_cross_id_resolved_broker_ids + n_missing_attr_resolved_broker_ids) / result.broker_ids_count if result.broker_ids_count else 0
         st.progress(min(1.0, pct / 100), text=f"{pct:.1f}% of broker trade IDs reconciled (PASS)")
 
         st.download_button(
@@ -1482,7 +1758,7 @@ if broker_file and murex_file:
         )
 
         tabs = st.tabs(["PASS", "FAIL", "Missing in Murex", "Missing in Broker", "No-ID Exceptions",
-                        "Cross-ID Resolved"])
+                        "Cross-ID Resolved", "Attr Resolved (Missing)"])
         with tabs[0]:
             st.dataframe(pd.DataFrame([
                 {"Link ID": r["link_id"], "Type": "Aggregated" if r["is_aggregated"] else "Single",
@@ -1526,5 +1802,27 @@ if broker_file and murex_file:
                 ]))
             else:
                 st.write("No cases were resolved by the cross-ID aggregation layer in this run.")
+        with tabs[6]:
+            if result.missing_attr_resolved:
+                st.caption(
+                    "Murex entries that had NO direct ID match in the broker file, but were "
+                    "resolved by finding broker rows in the Missing-in-Murex pool whose lots "
+                    "sum uniquely equals the Murex quantity (filtered by price, trader, commodity). "
+                    "See the 'Resolved - Attr Aggregation' sheet in the downloaded report for "
+                    "full leg-level detail."
+                )
+                st.dataframe(pd.DataFrame([
+                    {"Murex Link ID": r["murex_link_id"],
+                     "Trader": r["matched_by"]["trader"],
+                     "Price": r["matched_by"]["price"],
+                     "Commodity": r["matched_by"]["commodity"],
+                     "Broker Legs Combined": len(r["broker_legs"]),
+                     "Broker Qty": r["broker_qty_total"],
+                     "Murex Qty": r["murex_qty_total"],
+                     "Warnings": "; ".join(r.get("warning_notes", []))}
+                    for r in result.missing_attr_resolved
+                ]))
+            else:
+                st.write("No cases were resolved by the attribute aggregation (missing-set) layer in this run.")
 else:
     st.info("Upload both the Broker file and the Murex extract to begin.")
