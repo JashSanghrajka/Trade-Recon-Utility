@@ -1082,17 +1082,34 @@ def _resolve_missing_by_attribute_aggregation(
                 if not narrowed.empty:
                     candidates = narrowed
 
-            # --- Unique subset-sum check for THIS leg -----------------------
-            items = [(str(r), candidates.at[r, "quantity"]) for r in candidates.index]
-            is_unique, winning_keys = _find_exact_subset_unique(
-                items, target_qty, config.quantity_tolerance,
-                limit=config.cross_id_subset_sum_item_limit,
-            )
+            # Fast path for large candidate pools: if all available candidate
+            # lots at this price/trader bucket sum exactly to the leg target,
+            # take the full pool directly. This avoids false "unresolved"
+            # outcomes when the subset solver's safety limit truncates items.
+            candidates = candidates[candidates["quantity"] > 0]
+            total_candidate_qty = float(candidates["quantity"].sum()) if not candidates.empty else 0.0
+            if candidates.empty:
+                unresolved_legs.append(m_leg)
+                unresolved_comments.append(
+                    f"Leg row {m_leg.get('_row_ref')}: candidate pool has no positive quantity rows."
+                )
+                continue
+            if abs(total_candidate_qty - target_qty) <= config.quantity_tolerance:
+                chosen_idx = [int(r) for r in candidates.index]
+                is_unique = True
+                winning_keys = [str(r) for r in chosen_idx]
+            else:
+                # --- Unique subset-sum check for THIS leg -------------------
+                items = [(str(r), candidates.at[r, "quantity"]) for r in candidates.index]
+                is_unique, winning_keys = _find_exact_subset_unique(
+                    items, target_qty, config.quantity_tolerance,
+                    limit=config.cross_id_subset_sum_item_limit,
+                )
 
             if not is_unique:
                 unresolved_legs.append(m_leg)
                 unresolved_comments.append(
-                    f"Leg row {m_leg.get('_row_ref')}: searched {len(items)} candidate row(s) "
+                    f"Leg row {m_leg.get('_row_ref')}: searched {len(candidates)} candidate row(s) "
                     f"(price={price}, trader='{trader}', commodity='{commodity}') for unique "
                     f"subset = {target_qty}; no unique solution."
                 )
