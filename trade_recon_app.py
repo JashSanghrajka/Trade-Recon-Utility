@@ -290,9 +290,13 @@ def normalise(df: pd.DataFrame, column_map: dict, source_label: str,
     out["instrument"] = out["instrument"].astype(str).str.strip().str.upper()
     out["instrument"] = out["instrument"].replace({"NONE": None, "NAN": None})
 
-    for col in ("trade_id", "currency", "broker", "counterparty", "trader"):
+    for col in ("trade_id", "currency", "broker", "counterparty"):
         out[col] = out[col].astype(str).str.strip()
         out[col] = out[col].replace({"None": None, "nan": None, "": None})
+
+    # Normalise trader to uppercase so matching is case-insensitive across files.
+    out["trader"] = out["trader"].astype(str).str.strip().str.upper()
+    out["trader"] = out["trader"].replace({"NONE": None, "NAN": None, "": None})
 
     out["_source"] = source_label
     out["_row_ref"] = df.index + 2
@@ -1043,6 +1047,18 @@ def _resolve_missing_by_attribute_aggregation(
 
         candidates = broker_df.loc[candidate_idx].copy()
 
+        # Optional narrowing: when broker IDs are granular children of the
+        # Murex ID (e.g. ID178...000001 under ID178...), prefer that family.
+        m_link_id = murex_entry.get("link_id")
+        if m_link_id is not None:
+            m_link_id = str(m_link_id).strip().upper()
+            if m_link_id:
+                family = candidates[
+                    candidates["link_id"].astype(str).str.strip().str.upper().str.startswith(m_link_id)
+                ]
+                if not family.empty:
+                    candidates = family
+
         # Filter 1: exact price
         candidates = candidates[
             candidates["price"].notna() &
@@ -1780,7 +1796,8 @@ if broker_file and murex_file:
             ]))
         with tabs[3]:
             st.dataframe(pd.DataFrame([
-                {"Link ID": e["link_id"], "Murex Qty Total": e["murex_qty_total"], "Legs": len(e["murex_legs"])}
+                {"Link ID": e["link_id"], "Murex Qty Total": e["murex_qty_total"],
+                 "Legs": len(e["murex_legs"]), "Note": e.get("attr_match_comment", "")}
                 for e in result.missing_in_broker
             ]))
         with tabs[4]:
