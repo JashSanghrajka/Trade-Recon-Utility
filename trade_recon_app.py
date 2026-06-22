@@ -988,9 +988,8 @@ def _resolve_missing_by_attribute_aggregation(
     if not config.enable_missing_attr_resolution:
         return
 
-    # Build _row_ref -> dataframe index lookups for fast attribute access.
+    # Build _row_ref -> dataframe index lookup for fast attribute access.
     b_lookup = {broker_df.at[i, "_row_ref"]: i for i in broker_df.index}
-    m_lookup = {murex_df.at[i, "_row_ref"]: i for i in murex_df.index}
 
     # Which broker _row_refs are currently orphaned (in missing_in_murex)?
     orphan_broker_refs = set()
@@ -1004,137 +1003,145 @@ def _resolve_missing_by_attribute_aggregation(
     still_missing_broker = []
 
     for murex_entry in result.missing_in_broker:
-        m_legs = murex_entry["murex_legs"]
-        target_qty = murex_entry["murex_qty_total"]
-
-        # --- Pull trader / price / commodity from the Murex leg(s) ----------
-        trader = None
-        price = None
-        commodity = None
-        for leg in m_legs:
-            ref = leg.get("_row_ref")
-            idx = m_lookup.get(ref)
-            if idx is None:
-                continue
-            if trader is None:
-                raw = murex_df.at[idx, "trader"]
-                if raw is not None and not (isinstance(raw, float) and pd.isna(raw)):
-                    trader = str(raw).strip() or None
-            if price is None:
-                p = murex_df.at[idx, "price"]
-                if p is not None and not (isinstance(p, float) and pd.isna(p)):
-                    try:
-                        price = float(p)
-                    except (ValueError, TypeError):
-                        pass
-            if commodity is None:
-                c = murex_df.at[idx, "instrument"]
-                if c and str(c) not in ("None", "nan", "", "NONE"):
-                    commodity = str(c).strip().upper() or None
-
-        # Price is the minimum required filter; without it we cannot safely
-        # narrow candidates, so leave the entry as Missing.
-        if price is None:
-            still_missing_broker.append(murex_entry)
-            continue
-
-        # --- Candidate pool: orphaned broker rows not yet consumed -----------
-        available_refs = orphan_broker_refs - consumed_broker_refs
-        candidate_idx = [b_lookup[ref] for ref in available_refs if ref in b_lookup]
-        if not candidate_idx:
-            still_missing_broker.append(murex_entry)
-            continue
-
-        candidates = broker_df.loc[candidate_idx].copy()
-
-        # Optional narrowing: when broker IDs are granular children of the
-        # Murex ID (e.g. ID178...000001 under ID178...), prefer that family.
         m_link_id = murex_entry.get("link_id")
-        if m_link_id is not None:
-            m_link_id = str(m_link_id).strip().upper()
-            if m_link_id:
-                family = candidates[
-                    candidates["link_id"].astype(str).str.strip().str.upper().str.startswith(m_link_id)
-                ]
-                if not family.empty:
-                    candidates = family
+        unresolved_legs = []
+        unresolved_comments = []
 
-        # Filter 1: exact price
-        candidates = candidates[
-            candidates["price"].notna() &
-            (candidates["price"].sub(price).abs() <= CROSS_ID_PRICE_TOLERANCE)
-        ]
-        if candidates.empty:
-            still_missing_broker.append(murex_entry)
-            continue
+        for m_leg in murex_entry["murex_legs"]:
+            target_qty = m_leg.get("quantity")
+            try:
+                target_qty = float(target_qty)
+            except (TypeError, ValueError):
+                target_qty = None
 
-        # Filter 2: trader (if available on the Murex side)
-        if trader:
-            narrowed = candidates[candidates["trader"] == trader]
-            if not narrowed.empty:
-                candidates = narrowed
+            price = m_leg.get("price")
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                price = None
 
-        # Filter 3: commodity/instrument (only if still > 1 candidate)
-        if len(candidates) > 1 and commodity:
-            narrowed = candidates[candidates["instrument"] == commodity]
-            if not narrowed.empty:
-                candidates = narrowed
+            raw_trader = m_leg.get("trader")
+            trader = str(raw_trader).strip().upper() if raw_trader else None
+            trader = trader or None
 
-        # --- Unique subset-sum check ----------------------------------------
-        items = [(str(r), candidates.at[r, "quantity"]) for r in candidates.index]
-        is_unique, winning_keys = _find_exact_subset_unique(
-            items, target_qty, config.quantity_tolerance,
-            limit=config.cross_id_subset_sum_item_limit,
-        )
+            raw_commodity = m_leg.get("instrument")
+            commodity = str(raw_commodity).strip().upper() if raw_commodity else None
+            commodity = commodity or None
 
-        if not is_unique:
-            murex_entry["attr_match_comment"] = (
-                f"Attribute aggregation searched {len(items)} candidate broker row(s) "
-                f"(price={price}, trader='{trader}', commodity='{commodity}') for a unique "
-                f"subset summing to {target_qty} lots. "
-                "Either no combination was found or more than one valid combination "
-                "exists — left as Missing in Broker for manual review."
+            # Price and quantity are minimum required fields for safe matching.
+            if price is None or target_qty is None or target_qty <= 0:
+                unresolved_legs.append(m_leg)
+                unresolved_comments.append(
+                    f"Leg row {m_leg.get('_row_ref')}: missing/invalid price or quantity."
+                )
+                continue
+
+            # --- Candidate pool: orphaned broker rows not yet consumed -------
+            available_refs = orphan_broker_refs - consumed_broker_refs
+            candidate_idx = [b_lookup[ref] for ref in available_refs if ref in b_lookup]
+            if not candidate_idx:
+                unresolved_legs.append(m_leg)
+                unresolved_comments.append(
+                    f"Leg row {m_leg.get('_row_ref')}: no broker orphan rows available."
+                )
+                continue
+
+            candidates = broker_df.loc[candidate_idx].copy()
+
+            # Optional narrowing: prefer broker child IDs under this Murex parent ID.
+            if m_link_id is not None:
+                m_parent = str(m_link_id).strip().upper()
+                if m_parent:
+                    family = candidates[
+                        candidates["link_id"].astype(str).str.strip().str.upper().str.startswith(m_parent)
+                    ]
+                    if not family.empty:
+                        candidates = family
+
+            # Filter 1: exact price
+            candidates = candidates[
+                candidates["price"].notna() &
+                (candidates["price"].sub(price).abs() <= CROSS_ID_PRICE_TOLERANCE)
+            ]
+            if candidates.empty:
+                unresolved_legs.append(m_leg)
+                unresolved_comments.append(
+                    f"Leg row {m_leg.get('_row_ref')}: no broker candidates at price {price}."
+                )
+                continue
+
+            # Filter 2: trader (if available on Murex leg)
+            if trader:
+                narrowed = candidates[candidates["trader"] == trader]
+                if not narrowed.empty:
+                    candidates = narrowed
+
+            # Filter 3: commodity (only if still ambiguous)
+            if len(candidates) > 1 and commodity:
+                narrowed = candidates[candidates["instrument"] == commodity]
+                if not narrowed.empty:
+                    candidates = narrowed
+
+            # --- Unique subset-sum check for THIS leg -----------------------
+            items = [(str(r), candidates.at[r, "quantity"]) for r in candidates.index]
+            is_unique, winning_keys = _find_exact_subset_unique(
+                items, target_qty, config.quantity_tolerance,
+                limit=config.cross_id_subset_sum_item_limit,
             )
-            still_missing_broker.append(murex_entry)
-            continue
 
-        # --- Resolved: exactly one unambiguous combination ------------------
-        chosen_idx = [int(r) for r in winning_keys]
-        chosen_refs = {broker_df.at[i, "_row_ref"] for i in chosen_idx}
-        consumed_broker_refs.update(chosen_refs)
+            if not is_unique:
+                unresolved_legs.append(m_leg)
+                unresolved_comments.append(
+                    f"Leg row {m_leg.get('_row_ref')}: searched {len(items)} candidate row(s) "
+                    f"(price={price}, trader='{trader}', commodity='{commodity}') for unique "
+                    f"subset = {target_qty}; no unique solution."
+                )
+                continue
 
-        warning_notes = []
-        b_dates = broker_df.loc[chosen_idx, "trade_date"].dropna().unique()
-        b_directions = broker_df.loc[chosen_idx, "direction"].dropna().unique()
-        if len(b_dates) > 1:
-            warning_notes.append("Trade dates differ across the combined broker rows.")
-        if len(b_directions) > 1:
-            warning_notes.append("Direction (buy/sell) differs across the combined broker rows.")
-        m_dates_raw = [leg.get("trade_date") for leg in m_legs]
-        m_dates_valid = [d for d in m_dates_raw if d]
-        if len(b_dates) == 1 and len(m_dates_valid) == 1:
-            if str(b_dates[0])[:10] != str(m_dates_valid[0])[:10]:
-                warning_notes.append("Trade date differs between broker and Murex side.")
+            # --- Resolved leg -----------------------------------------------
+            chosen_idx = [int(r) for r in winning_keys]
+            chosen_refs = {broker_df.at[i, "_row_ref"] for i in chosen_idx}
+            consumed_broker_refs.update(chosen_refs)
 
-        resolved_record = {
-            "murex_link_id": murex_entry["link_id"],
-            "resolution_type": "Resolved by Attribute Aggregation (Missing sets)",
-            "matched_by": {"trader": trader, "price": price, "commodity": commodity},
-            "broker_legs": _fmt_many(broker_df, chosen_idx),
-            "murex_legs": m_legs,
-            "broker_qty_total": float(broker_df.loc[chosen_idx, "quantity"].sum()),
-            "murex_qty_total": target_qty,
-            "warning_notes": warning_notes,
-        }
-        result.missing_attr_resolved.append(resolved_record)
+            warning_notes = []
+            b_dates = broker_df.loc[chosen_idx, "trade_date"].dropna().unique()
+            b_directions = broker_df.loc[chosen_idx, "direction"].dropna().unique()
+            if len(b_dates) > 1:
+                warning_notes.append("Trade dates differ across the combined broker rows.")
+            if len(b_directions) > 1:
+                warning_notes.append("Direction (buy/sell) differs across the combined broker rows.")
+            m_leg_date = m_leg.get("trade_date")
+            if len(b_dates) == 1 and m_leg_date:
+                if str(b_dates[0])[:10] != str(m_leg_date)[:10]:
+                    warning_notes.append("Trade date differs between broker and Murex side.")
 
-        # Remove consumed broker rows from missing_in_murex.
-        result.missing_in_murex = [
-            e for e in result.missing_in_murex
-            if not set(leg["_row_ref"] for leg in e["broker_legs"]).issubset(chosen_refs)
-        ]
-        # Shrink the orphan pool for subsequent iterations.
-        orphan_broker_refs -= chosen_refs
+            resolved_record = {
+                "murex_link_id": m_link_id,
+                "resolution_type": "Resolved by Attribute Aggregation (Missing sets)",
+                "matched_by": {"trader": trader, "price": price, "commodity": commodity},
+                "broker_legs": _fmt_many(broker_df, chosen_idx),
+                "murex_legs": [m_leg],
+                "broker_qty_total": float(broker_df.loc[chosen_idx, "quantity"].sum()),
+                "murex_qty_total": target_qty,
+                "warning_notes": warning_notes,
+            }
+            result.missing_attr_resolved.append(resolved_record)
+
+            # Remove consumed broker rows from missing_in_murex.
+            result.missing_in_murex = [
+                e for e in result.missing_in_murex
+                if not set(leg["_row_ref"] for leg in e["broker_legs"]).issubset(chosen_refs)
+            ]
+            orphan_broker_refs -= chosen_refs
+
+        # Keep only unresolved legs (if any) in Missing in Broker.
+        if unresolved_legs:
+            still_missing_broker.append({
+                "link_id": m_link_id,
+                "murex_legs": unresolved_legs,
+                "murex_qty_total": float(sum((leg.get("quantity") or 0.0) for leg in unresolved_legs)),
+                "attr_match_comment": " | ".join(unresolved_comments[:5]),
+            })
 
     result.missing_in_broker = still_missing_broker
 
