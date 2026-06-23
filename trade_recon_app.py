@@ -133,6 +133,7 @@ DEFAULT_QTY_TOLERANCE = 0.0           # absolute lots/nominal difference allowed
 DEFAULT_GROUP_KEYS = ["instrument", "direction", "prompt_date", "trade_date", "price"]
 DEFAULT_ENABLE_FALLBACK_MATCHING = True   # attribute-based matching for no-ID trades
 SUBSET_SUM_ITEM_LIMIT = 60
+DEFAULT_ALLOW_AGGREGATED_PRICE_VARIANCE = False  # optional enhancement, OFF by default
 
 # --- 1g. Cross-ID aggregation (enhancement layer, Section 7) ------------------
 # This is an OPTIONAL, ADDITIVE post-processing step that runs only after the
@@ -168,6 +169,7 @@ class ReconConfig:
     group_keys: List[str] = field(default_factory=lambda: list(DEFAULT_GROUP_KEYS))
     enable_fallback_matching: bool = DEFAULT_ENABLE_FALLBACK_MATCHING
     subset_sum_item_limit: int = SUBSET_SUM_ITEM_LIMIT
+    allow_aggregated_price_variance: bool = DEFAULT_ALLOW_AGGREGATED_PRICE_VARIANCE
     enable_cross_id_aggregation: bool = DEFAULT_ENABLE_CROSS_ID_AGGREGATION
     cross_id_subset_sum_item_limit: int = CROSS_ID_SUBSET_SUM_ITEM_LIMIT
     enable_missing_attr_resolution: bool = DEFAULT_ENABLE_MISSING_ATTR_RESOLUTION
@@ -367,6 +369,7 @@ def _compare_id_group(link_id: str, b_rows: pd.DataFrame, m_rows: pd.DataFrame,
     b_directions = b_rows["direction"].dropna().unique()
     m_prices = m_rows["price"].dropna().unique()
     m_directions = m_rows["direction"].dropna().unique()
+    is_aggregated = len(b_rows) > 1 or len(m_rows) > 1
 
     issues = []
 
@@ -380,18 +383,26 @@ def _compare_id_group(link_id: str, b_rows: pd.DataFrame, m_rows: pd.DataFrame,
         issues.append({"field": "direction", "reason": "Direction mismatch",
                         "broker_value": b_directions[0], "murex_value": m_directions[0]})
 
-    if len(b_prices) > 1:
-        issues.append({"field": "price", "reason": "Broker legs have inconsistent price for this ID",
-                        "broker_value": ", ".join(str(p) for p in b_prices), "murex_value": ""})
-    if len(m_prices) > 1:
-        issues.append({"field": "price", "reason": "Murex legs have inconsistent price for this ID",
-                        "broker_value": "", "murex_value": ", ".join(str(p) for p in m_prices)})
-    if len(b_prices) == 1 and len(m_prices) == 1:
-        if abs(b_prices[0] - m_prices[0]) > config.price_tolerance:
-            issues.append({"field": "price", "reason": "Price mismatch",
-                            "broker_value": b_prices[0], "murex_value": m_prices[0]})
+    qty_mismatch = abs(b_qty_total - m_qty_total) > config.quantity_tolerance
+    price_waiver_applied = (
+        config.allow_aggregated_price_variance
+        and is_aggregated
+        and not qty_mismatch
+    )
 
-    if abs(b_qty_total - m_qty_total) > config.quantity_tolerance:
+    if not price_waiver_applied:
+        if len(b_prices) > 1:
+            issues.append({"field": "price", "reason": "Broker legs have inconsistent price for this ID",
+                            "broker_value": ", ".join(str(p) for p in b_prices), "murex_value": ""})
+        if len(m_prices) > 1:
+            issues.append({"field": "price", "reason": "Murex legs have inconsistent price for this ID",
+                            "broker_value": "", "murex_value": ", ".join(str(p) for p in m_prices)})
+        if len(b_prices) == 1 and len(m_prices) == 1:
+            if abs(b_prices[0] - m_prices[0]) > config.price_tolerance:
+                issues.append({"field": "price", "reason": "Price mismatch",
+                                "broker_value": b_prices[0], "murex_value": m_prices[0]})
+
+    if qty_mismatch:
         issues.append({"field": "quantity", "reason": "Lots/Quantity mismatch (broker total vs Murex total)",
                         "broker_value": b_qty_total, "murex_value": m_qty_total})
 
@@ -405,7 +416,6 @@ def _compare_id_group(link_id: str, b_rows: pd.DataFrame, m_rows: pd.DataFrame,
                         "broker_value": pd.Timestamp(b_dates[0]).strftime("%Y-%m-%d"),
                         "murex_value": pd.Timestamp(m_dates[0]).strftime("%Y-%m-%d")})
 
-    is_aggregated = len(b_rows) > 1 or len(m_rows) > 1
     record = {
         "link_id": link_id,
         "is_aggregated": is_aggregated,
@@ -417,7 +427,13 @@ def _compare_id_group(link_id: str, b_rows: pd.DataFrame, m_rows: pd.DataFrame,
         "murex_price": m_prices[0] if len(m_prices) == 1 else None,
         "broker_direction": b_directions[0] if len(b_directions) == 1 else None,
         "murex_direction": m_directions[0] if len(m_directions) == 1 else None,
+        "price_waiver_applied": price_waiver_applied,
     }
+    if price_waiver_applied:
+        record["price_waiver_note"] = (
+            "Price differences ignored for this aggregated ID because quantity totals matched "
+            "and the aggregated price-variance rule was enabled."
+        )
 
     if issues:
         record["issues"] = issues
@@ -1298,6 +1314,9 @@ def _build_summary(wb, result: ReconResult, config: ReconConfig):
     ws.cell(row=r, column=1, value="Fallback attribute matching (no-ID rows)").font = BOLD
     ws.cell(row=r, column=2, value=str(config.enable_fallback_matching))
     r += 1
+    ws.cell(row=r, column=1, value="Allow aggregated-ID price variance (qty must match)").font = BOLD
+    ws.cell(row=r, column=2, value=str(config.allow_aggregated_price_variance))
+    r += 1
     ws.cell(row=r, column=1, value="Fallback group/match keys").font = BOLD
     ws.cell(row=r, column=2, value=", ".join(config.group_keys))
     r += 1
@@ -1427,7 +1446,7 @@ def _build_aggregated_detail(wb, result: ReconResult):
     ws = wb.create_sheet("Aggregated Matches Detail")
     headers = ["Link/Trade ID", "Broker Leg Count", "Broker Lots (each leg)",
                "Broker Lots Sum", "Murex Leg Count", "Murex Lots (each leg)",
-               "Murex Lots Sum", "Difference", "Status"]
+               "Murex Lots Sum", "Difference", "Status", "Reason(s)"]
     _write_header(ws, headers)
     r = 2
     combined = [(rec, "PASS") for rec in result.id_passed_aggregated] + \
@@ -1436,8 +1455,12 @@ def _build_aggregated_detail(wb, result: ReconResult):
         b_lots = ", ".join(str(l["quantity"]) for l in rec["broker_legs"])
         m_lots = ", ".join(str(l["quantity"]) for l in rec["murex_legs"])
         diff = round(rec["broker_qty_total"] - rec["murex_qty_total"], 4)
+        if status == "FAIL":
+            reason_text = "; ".join(i.get("reason", "") for i in rec.get("issues", []))
+        else:
+            reason_text = rec.get("price_waiver_note", "")
         ws.append([rec["link_id"], len(rec["broker_legs"]), b_lots, rec["broker_qty_total"],
-                   len(rec["murex_legs"]), m_lots, rec["murex_qty_total"], diff, status])
+                   len(rec["murex_legs"]), m_lots, rec["murex_qty_total"], diff, status, reason_text])
         fill = PASS_FILL if status == "PASS" else FAIL_FILL
         for c in range(1, len(headers) + 1):
             ws.cell(row=r, column=c).fill = fill
@@ -1722,6 +1745,11 @@ if broker_file and murex_file:
         qty_tol = st.number_input("Quantity tolerance", min_value=0.0, value=DEFAULT_QTY_TOLERANCE, step=0.01)
     with cfg_col3:
         enable_fallback = st.checkbox("Enable fallback attribute matching for no-ID rows", value=True)
+        allow_agg_price_variance = st.checkbox(
+            "Allow aggregated-ID price variance when qty matches",
+            value=DEFAULT_ALLOW_AGGREGATED_PRICE_VARIANCE,
+            help="Optional enhancement. For aggregated IDs only, price-related mismatches are ignored "
+                 "when broker total quantity equals Murex total quantity. Direction/date checks still apply.")
         fallback_keys = st.multiselect(
             "Fallback match/group fields", options=[f for f in CANONICAL_FIELDS if f not in ("trade_id", "link_id")],
             default=DEFAULT_GROUP_KEYS)
@@ -1748,6 +1776,7 @@ if broker_file and murex_file:
         quantity_tolerance=qty_tol,
         group_keys=fallback_keys,
         enable_fallback_matching=enable_fallback,
+        allow_aggregated_price_variance=allow_agg_price_variance,
         enable_cross_id_aggregation=enable_cross_id,
         enable_missing_attr_resolution=enable_missing_attr,
     )
