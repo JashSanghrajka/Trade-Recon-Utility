@@ -636,6 +636,33 @@ def reconcile(broker_df: pd.DataFrame, murex_df: pd.DataFrame, config: ReconConf
     # --- Step 3: fallback attribute matching for rows with no usable ID ------
     _fallback_attribute_match(b_without_id, m_without_id, config, result)
 
+    # --- Step 4: promote broker no-ID leftovers into Missing-in-Murex pool ----
+    # Rare operational case: broker rows can arrive without a usable link_id
+    # while the Murex side still has G.ID. Promote such broker leftovers into
+    # the Missing-in-Murex pool so Section 8 can reconcile them by attributes.
+    if result.no_id_unmatched_broker and result.missing_in_broker:
+        still_no_id_unmatched = []
+        for leg in result.no_id_unmatched_broker:
+            qty = leg.get("quantity")
+            try:
+                qty_val = float(qty)
+            except (TypeError, ValueError):
+                qty_val = 0.0
+
+            # Section 8 requires a meaningful quantity to run subset matching.
+            if qty_val <= 0:
+                still_no_id_unmatched.append(leg)
+                continue
+
+            pseudo_link_id = f"NO_ID_BROKER_ROW_{leg.get('_row_ref')}"
+            result.missing_in_murex.append({
+                "link_id": pseudo_link_id,
+                "broker_legs": [leg],
+                "broker_qty_total": qty_val,
+            })
+
+        result.no_id_unmatched_broker = still_no_id_unmatched
+
     return result
 
 
@@ -1048,6 +1075,10 @@ def _resolve_missing_by_attribute_aggregation(
             trader = str(raw_trader).strip().upper() if raw_trader else None
             trader = trader or None
 
+            raw_broker = m_leg.get("broker")
+            broker_name = str(raw_broker).strip().upper() if raw_broker else None
+            broker_name = broker_name or None
+
             raw_commodity = m_leg.get("instrument")
             commodity = str(raw_commodity).strip().upper() if raw_commodity else None
             commodity = commodity or None
@@ -1095,12 +1126,20 @@ def _resolve_missing_by_attribute_aggregation(
                 continue
 
             # Filter 2: trader (if available on Murex leg)
+            if broker_name:
+                narrowed = candidates[
+                    candidates["broker"].astype(str).str.strip().str.upper() == broker_name
+                ]
+                if not narrowed.empty:
+                    candidates = narrowed
+
+            # Filter 3: trader (if available on Murex leg)
             if trader:
                 narrowed = candidates[candidates["trader"] == trader]
                 if not narrowed.empty:
                     candidates = narrowed
 
-            # Filter 3: commodity (only if still ambiguous)
+            # Filter 4: commodity (only if still ambiguous)
             if len(candidates) > 1 and commodity:
                 narrowed = candidates[candidates["instrument"] == commodity]
                 if not narrowed.empty:
@@ -1134,7 +1173,7 @@ def _resolve_missing_by_attribute_aggregation(
                 unresolved_legs.append(m_leg)
                 unresolved_comments.append(
                     f"Leg row {m_leg.get('_row_ref')}: searched {len(candidates)} candidate row(s) "
-                    f"(price={price}, trader='{trader}', commodity='{commodity}') for unique "
+                    f"(broker='{broker_name}', price={price}, trader='{trader}', commodity='{commodity}') for unique "
                     f"subset = {target_qty}; no unique solution."
                 )
                 continue
@@ -1159,7 +1198,7 @@ def _resolve_missing_by_attribute_aggregation(
             resolved_record = {
                 "murex_link_id": m_link_id,
                 "resolution_type": "Resolved by Attribute Aggregation (Missing sets)",
-                "matched_by": {"trader": trader, "price": price, "commodity": commodity},
+                "matched_by": {"broker": broker_name, "trader": trader, "price": price, "commodity": commodity},
                 "broker_legs": _fmt_many(broker_df, chosen_idx),
                 "murex_legs": [m_leg],
                 "broker_qty_total": float(broker_df.loc[chosen_idx, "quantity"].sum()),
