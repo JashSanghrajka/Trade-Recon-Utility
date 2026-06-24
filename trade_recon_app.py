@@ -635,13 +635,26 @@ def reconcile(broker_df: pd.DataFrame, murex_df: pd.DataFrame, config: ReconConf
 
     # --- Step 3: fallback attribute matching for rows with no usable ID ------
     # If both files have no usable link_id at all, run a deterministic
-    # attribute mode aligned to operations guidance: trader + price,
-    # with quantity used by the matcher itself for 1:1/aggregation checks.
+    # attribute mode aligned to operations guidance. Prefer trader + price,
+    # optionally add commodity when present on BOTH sides. If trader is
+    # missing on either side, degrade safely to price-only grouping so
+    # quantity-based matching still runs instead of returning zero.
     if b_with_id.empty and m_with_id.empty:
+        b_has_trader = b_without_id["trader"].notna().any()
+        m_has_trader = m_without_id["trader"].notna().any()
+        b_has_commodity = b_without_id["instrument"].notna().any()
+        m_has_commodity = m_without_id["instrument"].notna().any()
+
+        dynamic_keys = ["price"]
+        if b_has_trader and m_has_trader:
+            dynamic_keys.insert(0, "trader")
+        if b_has_commodity and m_has_commodity:
+            dynamic_keys.append("instrument")
+
         no_id_config = ReconConfig(
             price_tolerance=config.price_tolerance,
             quantity_tolerance=config.quantity_tolerance,
-            group_keys=["trader", "price"],
+            group_keys=dynamic_keys,
             enable_fallback_matching=config.enable_fallback_matching,
             subset_sum_item_limit=config.subset_sum_item_limit,
             allow_aggregated_price_variance=config.allow_aggregated_price_variance,
