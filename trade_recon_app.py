@@ -862,6 +862,14 @@ def _resolve_cross_id_aggregation(broker_df: pd.DataFrame, murex_df: pd.DataFram
             continue
 
         price = fail_rec.get("broker_price")
+        if price is None or (isinstance(price, float) and pd.isna(price)):
+            fail_rec["cross_id_comment"] = (
+                "Cross-ID aggregation could not be attempted: broker price is missing "
+                "or non-numeric on this failed case."
+            )
+            still_failed.append(fail_rec)
+            continue
+
         commodity = fail_rec["broker_legs"][0].get("instrument") if fail_rec["broker_legs"] else None
 
         # Candidate pool: orphaned broker rows (not already consumed, not
