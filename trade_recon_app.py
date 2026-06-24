@@ -634,7 +634,24 @@ def reconcile(broker_df: pd.DataFrame, murex_df: pd.DataFrame, config: ReconConf
         })
 
     # --- Step 3: fallback attribute matching for rows with no usable ID ------
-    _fallback_attribute_match(b_without_id, m_without_id, config, result)
+    # If both files have no usable link_id at all, run a deterministic
+    # attribute mode aligned to operations guidance: trader + price,
+    # with quantity used by the matcher itself for 1:1/aggregation checks.
+    if b_with_id.empty and m_with_id.empty:
+        no_id_config = ReconConfig(
+            price_tolerance=config.price_tolerance,
+            quantity_tolerance=config.quantity_tolerance,
+            group_keys=["trader", "price"],
+            enable_fallback_matching=config.enable_fallback_matching,
+            subset_sum_item_limit=config.subset_sum_item_limit,
+            allow_aggregated_price_variance=config.allow_aggregated_price_variance,
+            enable_cross_id_aggregation=config.enable_cross_id_aggregation,
+            cross_id_subset_sum_item_limit=config.cross_id_subset_sum_item_limit,
+            enable_missing_attr_resolution=config.enable_missing_attr_resolution,
+        )
+        _fallback_attribute_match(b_without_id, m_without_id, no_id_config, result)
+    else:
+        _fallback_attribute_match(b_without_id, m_without_id, config, result)
 
     # --- Step 4: promote broker no-ID leftovers into Missing-in-Murex pool ----
     # Rare operational case: broker rows can arrive without a usable link_id
