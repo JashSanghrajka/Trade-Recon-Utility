@@ -1914,6 +1914,7 @@ if broker_file and murex_file:
             })
 
         n_pass = len(result.id_passed) + len(result.id_passed_aggregated)
+        n_no_id_matched_cases = len(result.fallback_matched) + len(result.fallback_aggregated)
         m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
         m1.metric("Broker IDs", result.broker_ids_count)
         m2.metric("Murex IDs", result.murex_ids_count)
@@ -1924,10 +1925,29 @@ if broker_file and murex_file:
         m7.metric("Cross-ID Resolved", len(result.cross_id_resolved))
         m8.metric("Attr Resolved", len(result.missing_attr_resolved))
 
+        st.caption(
+            f"No-ID matches found: {n_no_id_matched_cases} cases "
+            f"({len(result.fallback_matched)} direct + {len(result.fallback_aggregated)} aggregated)."
+        )
+        if result.broker_ids_count == 0 and result.murex_ids_count == 0:
+            st.info(
+                "Both files have no usable Link ID after mapping/normalization. "
+                "So ID-based PASS/FAIL metrics remain 0 and reconciliation is being done by No-ID fallback mode."
+            )
+
         n_cross_id_resolved_broker_ids = sum(len(r["broker_legs"]) for r in result.cross_id_resolved)
         n_missing_attr_resolved_broker_ids = sum(len(r["broker_legs"]) for r in result.missing_attr_resolved)
-        pct = 100 * (n_pass + n_cross_id_resolved_broker_ids + n_missing_attr_resolved_broker_ids) / result.broker_ids_count if result.broker_ids_count else 0
-        st.progress(min(1.0, pct / 100), text=f"{pct:.1f}% of broker trade IDs reconciled (PASS)")
+        if result.broker_ids_count:
+            pct = 100 * (n_pass + n_cross_id_resolved_broker_ids + n_missing_attr_resolved_broker_ids) / result.broker_ids_count
+            progress_text = f"{pct:.1f}% of broker trade IDs reconciled (PASS)"
+        else:
+            broker_rows_reconciled = (
+                len(result.fallback_matched)
+                + sum(len(a["broker_trades"]) for a in result.fallback_aggregated)
+            )
+            pct = 100 * broker_rows_reconciled / result.broker_count if result.broker_count else 0
+            progress_text = f"{pct:.1f}% of broker rows reconciled via No-ID fallback"
+        st.progress(min(1.0, pct / 100), text=progress_text)
 
         st.download_button(
             "⬇️ Download Reconciliation Report (Excel)",
@@ -1939,12 +1959,40 @@ if broker_file and murex_file:
         tabs = st.tabs(["PASS", "FAIL", "Missing in Murex", "Missing in Broker", "No-ID Exceptions",
                         "Cross-ID Resolved", "Attr Resolved (Missing)"])
         with tabs[0]:
-            st.dataframe(pd.DataFrame([
-                {"Link ID": r["link_id"], "Type": "Aggregated" if r["is_aggregated"] else "Single",
-                 "Broker Qty": r["broker_qty_total"], "Murex Qty": r["murex_qty_total"],
-                 "Price": r["broker_price"]}
+            pass_rows = [
+                {
+                    "Mode": "ID",
+                    "Link ID": r["link_id"],
+                    "Type": "Aggregated" if r["is_aggregated"] else "Single",
+                    "Broker Qty": r["broker_qty_total"],
+                    "Murex Qty": r["murex_qty_total"],
+                    "Price": r["broker_price"],
+                }
                 for r in result.id_passed + result.id_passed_aggregated
-            ]))
+            ]
+            pass_rows += [
+                {
+                    "Mode": "No-ID Fallback",
+                    "Link ID": "(no id)",
+                    "Type": "1:1",
+                    "Broker Qty": m["broker"].get("quantity"),
+                    "Murex Qty": m["murex"].get("quantity"),
+                    "Price": m["broker"].get("price"),
+                }
+                for m in result.fallback_matched
+            ]
+            pass_rows += [
+                {
+                    "Mode": "No-ID Fallback",
+                    "Link ID": "(no id)",
+                    "Type": "Aggregated",
+                    "Broker Qty": a["broker_qty_total"],
+                    "Murex Qty": a["murex_qty_total"],
+                    "Price": "",
+                }
+                for a in result.fallback_aggregated
+            ]
+            st.dataframe(pd.DataFrame(pass_rows))
         with tabs[1]:
             st.dataframe(pd.DataFrame([
                 {"Link ID": r["link_id"], "Issues": "; ".join(i["reason"] for i in r["issues"]),
