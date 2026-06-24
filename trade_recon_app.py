@@ -226,6 +226,13 @@ def _normalise_price(value):
     try:
         return float(str(value).replace(",", "").strip())
     except ValueError:
+        # Accept messy numeric strings like "102.35 USD" or "Price=102.35".
+        m = re.search(r"[-+]?\d*\.?\d+", str(value).replace(",", ""))
+        if m:
+            try:
+                return float(m.group(0))
+            except ValueError:
+                return None
         return None
 
 
@@ -233,8 +240,15 @@ def _normalise_quantity(value):
     if value is None or str(value).strip() == "":
         return 0.0
     try:
-        return float(str(value).replace(",", "").strip())
+        # Quantity is reconciled as lots/nominal magnitude; direction is checked separately.
+        return abs(float(str(value).replace(",", "").strip()))
     except ValueError:
+        m = re.search(r"[-+]?\d*\.?\d+", str(value).replace(",", ""))
+        if m:
+            try:
+                return abs(float(m.group(0)))
+            except ValueError:
+                return 0.0
         return 0.0
 
 
@@ -1143,10 +1157,11 @@ def _resolve_missing_by_attribute_aggregation(
                     if not family.empty:
                         candidates = family
 
-            # Filter 1: exact price
+            # Filter 1: price match (uses configured tolerance; exact when tolerance=0)
+            price_tol = max(config.price_tolerance, CROSS_ID_PRICE_TOLERANCE)
             candidates = candidates[
                 candidates["price"].notna() &
-                (candidates["price"].sub(price).abs() <= CROSS_ID_PRICE_TOLERANCE)
+                (candidates["price"].sub(price).abs() <= price_tol)
             ]
             if candidates.empty:
                 unresolved_legs.append(m_leg)
@@ -1879,6 +1894,24 @@ if broker_file and murex_file:
                 report_bytes = open(tmp.name, "rb").read()
 
         st.success("Reconciliation complete!")
+
+        with st.expander("Debug: Matching Counters", expanded=False):
+            st.write({
+                "broker_rows_total": int(len(broker_df)),
+                "murex_rows_total": int(len(murex_df)),
+                "broker_rows_with_id": int(broker_df["link_id"].notna().sum()),
+                "broker_rows_without_id": int(broker_df["link_id"].isna().sum()),
+                "murex_rows_with_id": int(murex_df["link_id"].notna().sum()),
+                "murex_rows_without_id": int(murex_df["link_id"].isna().sum()),
+                "fallback_matched": int(len(result.fallback_matched)),
+                "fallback_aggregated": int(len(result.fallback_aggregated)),
+                "no_id_unmatched_broker": int(len(result.no_id_unmatched_broker)),
+                "no_id_unmatched_murex": int(len(result.no_id_unmatched_murex)),
+                "missing_in_murex": int(len(result.missing_in_murex)),
+                "missing_in_broker": int(len(result.missing_in_broker)),
+                "cross_id_resolved": int(len(result.cross_id_resolved)),
+                "missing_attr_resolved": int(len(result.missing_attr_resolved)),
+            })
 
         n_pass = len(result.id_passed) + len(result.id_passed_aggregated)
         m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
